@@ -17,23 +17,22 @@ from src.storage import (
     HOLDINGS_COLUMNS,
     HOLDINGS_PATH,
     ORIGINAL_HOLDINGS_PATH,
-    PERFORMANCE_COLUMNS,
     PORTFOLIO_STATE_COLUMNS,
     REMINDERS_COLUMNS,
     initialize_data_files,
     load_holdings,
     load_original_holdings,
-    load_performance,
     load_portfolio_state,
     load_reminders,
     save_holdings,
     save_original_holdings,
-    save_performance,
     save_portfolio_state,
     save_reminders,
 )
 
 ONBOARDING_COLUMNS = ["ticker", "shares", "avg_buy_price", "position_type"]
+SELL_COLUMNS = ["ticker", "shares_sold", "cash_received"]
+BUYBACK_COLUMNS = ["ticker", "shares_bought", "avg_buy_price", "cash_spent"]
 DEFAULT_ANALYTICS_COLUMNS = [
     "ticker",
     "position_type",
@@ -59,7 +58,6 @@ DEFAULT_ANALYTICS_COLUMNS = [
 def reset_app_state() -> None:
     pd.DataFrame(columns=HOLDINGS_COLUMNS).to_csv(HOLDINGS_PATH, index=False)
     pd.DataFrame(columns=REMINDERS_COLUMNS).to_csv("data/reminders.csv", index=False)
-    pd.DataFrame(columns=PERFORMANCE_COLUMNS).to_csv("data/performance.csv", index=False)
     pd.DataFrame([{"free_cash": 0.0, "updated_at": datetime.now().isoformat()}], columns=PORTFOLIO_STATE_COLUMNS).to_csv(
         "data/portfolio_state.csv", index=False
     )
@@ -98,6 +96,24 @@ def build_default_onboarding_table() -> pd.DataFrame:
     )
 
 
+def build_default_sell_table() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {"ticker": "", "shares_sold": None, "cash_received": None},
+        ],
+        columns=SELL_COLUMNS,
+    )
+
+
+def build_default_buyback_table() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {"ticker": "", "shares_bought": None, "avg_buy_price": None, "cash_spent": None},
+        ],
+        columns=BUYBACK_COLUMNS,
+    )
+
+
 def normalize_onboarding_table(editor_df: pd.DataFrame) -> pd.DataFrame:
     normalized_df = editor_df.copy()
     normalized_df["ticker"] = normalized_df["ticker"].fillna("").astype(str).str.strip().str.upper()
@@ -109,13 +125,30 @@ def normalize_onboarding_table(editor_df: pd.DataFrame) -> pd.DataFrame:
     return normalized_df
 
 
-def filter_blank_rows(onboarding_df: pd.DataFrame) -> pd.DataFrame:
-    has_ticker = onboarding_df["ticker"].fillna("").astype(str).str.strip().ne("")
-    has_shares = onboarding_df["shares"].notna()
-    has_avg_buy_price = onboarding_df["avg_buy_price"].notna()
-    has_position_type = onboarding_df["position_type"].fillna("").astype(str).str.strip().ne("")
+def normalize_sell_table(editor_df: pd.DataFrame) -> pd.DataFrame:
+    normalized_df = editor_df.copy()
+    normalized_df["ticker"] = normalized_df["ticker"].fillna("").astype(str).str.strip().str.upper()
+    normalized_df["shares_sold"] = pd.to_numeric(normalized_df["shares_sold"], errors="coerce")
+    normalized_df["cash_received"] = pd.to_numeric(normalized_df["cash_received"], errors="coerce")
+    return normalized_df
 
-    meaningful_row_mask = has_ticker | has_shares | has_avg_buy_price | has_position_type
+
+def normalize_buyback_table(editor_df: pd.DataFrame) -> pd.DataFrame:
+    normalized_df = editor_df.copy()
+    normalized_df["ticker"] = normalized_df["ticker"].fillna("").astype(str).str.strip().str.upper()
+    normalized_df["shares_bought"] = pd.to_numeric(normalized_df["shares_bought"], errors="coerce")
+    normalized_df["avg_buy_price"] = pd.to_numeric(normalized_df["avg_buy_price"], errors="coerce")
+    normalized_df["cash_spent"] = pd.to_numeric(normalized_df["cash_spent"], errors="coerce")
+    return normalized_df
+
+
+def filter_blank_rows(onboarding_df: pd.DataFrame) -> pd.DataFrame:
+    has_any_values = onboarding_df.fillna("").astype(str).apply(lambda column: column.str.strip()).ne("").any(axis=1)
+    has_numeric_values = onboarding_df.select_dtypes(include=["number"]).notna().any(axis=1) if not onboarding_df.empty else pd.Series(dtype=bool)
+    if len(has_numeric_values) == len(onboarding_df):
+        meaningful_row_mask = has_any_values | has_numeric_values
+    else:
+        meaningful_row_mask = has_any_values
     return onboarding_df.loc[meaningful_row_mask].reset_index(drop=True)
 
 
@@ -167,6 +200,80 @@ def validate_onboarding_table(
     return errors
 
 
+def validate_sell_table(sell_df: pd.DataFrame, current_holdings_df: pd.DataFrame) -> list[str]:
+    errors: list[str] = []
+
+    if sell_df.empty:
+        return ["Please add at least one sale row."]
+
+    current_shares_by_ticker = current_holdings_df.set_index("ticker")["shares"].to_dict()
+
+    for _, row in sell_df.iterrows():
+        ticker = row["ticker"]
+        shares_sold = row["shares_sold"]
+        cash_received = row["cash_received"]
+
+        if not ticker:
+            errors.append("Each sale row must include a ticker.")
+            continue
+
+        if ticker not in current_shares_by_ticker:
+            errors.append(f"{ticker} is not in current holdings.")
+            continue
+
+        if pd.isna(shares_sold) or shares_sold <= 0:
+            errors.append(f"{ticker} must have a positive shares sold value.")
+            continue
+
+        if shares_sold > current_shares_by_ticker[ticker]:
+            errors.append(f"{ticker} cannot sell more shares than are currently held.")
+
+        if pd.isna(cash_received) or cash_received < 0:
+            errors.append(f"{ticker} must have a non-negative cash received value.")
+
+    return errors
+
+
+def validate_buyback_table(buyback_df: pd.DataFrame, current_holdings_df: pd.DataFrame, free_cash: float) -> list[str]:
+    errors: list[str] = []
+
+    if buyback_df.empty:
+        return ["Please add at least one buyback row."]
+
+    current_tickers = set(current_holdings_df["ticker"].dropna().astype(str).str.strip().str.upper().tolist())
+
+    total_cash_spent = 0.0
+    for _, row in buyback_df.iterrows():
+        ticker = row["ticker"]
+        shares_bought = row["shares_bought"]
+        avg_buy_price = row["avg_buy_price"]
+        cash_spent = row["cash_spent"]
+
+        if not ticker:
+            errors.append("Each buyback row must include a ticker.")
+            continue
+
+        if ticker not in current_tickers:
+            errors.append(f"{ticker} must already exist in holdings or monitors before buyback.")
+            continue
+
+        if pd.isna(shares_bought) or shares_bought <= 0:
+            errors.append(f"{ticker} must have a positive shares bought value.")
+
+        if pd.isna(avg_buy_price) or avg_buy_price < 0:
+            errors.append(f"{ticker} must have a non-negative average buy price.")
+
+        if pd.isna(cash_spent) or cash_spent < 0:
+            errors.append(f"{ticker} must have a non-negative cash spent value.")
+        else:
+            total_cash_spent += float(cash_spent)
+
+    if total_cash_spent > free_cash:
+        errors.append("Cash spent across buybacks cannot exceed current free cash.")
+
+    return errors
+
+
 def onboarding_to_holdings(onboarding_df: pd.DataFrame) -> pd.DataFrame:
     holdings_df = pd.DataFrame(columns=HOLDINGS_COLUMNS)
     holdings_df["ticker"] = onboarding_df["ticker"]
@@ -186,35 +293,36 @@ def render_onboarding_page() -> None:
         "or choose monitor if share count and average buy price should be optional."
     )
 
-    if "onboarding_table" not in st.session_state:
-        st.session_state.onboarding_table = build_default_onboarding_table()
+    if "onboarding_table_seed" not in st.session_state:
+        st.session_state.onboarding_table_seed = build_default_onboarding_table()
 
-    edited_df = st.data_editor(
-        st.session_state.onboarding_table,
-        num_rows="dynamic",
-        use_container_width=True,
-        column_config={
-            "ticker": st.column_config.TextColumn("Ticker", required=False),
-            "shares": st.column_config.NumberColumn("Shares", min_value=0.0, step=0.01, format="%.4f"),
-            "avg_buy_price": st.column_config.NumberColumn(
-                "Average Buy Price",
-                min_value=0.0,
-                step=0.01,
-                format="%.2f",
-            ),
-            "position_type": st.column_config.SelectboxColumn(
-                "Mode",
-                options=["", "monitor"],
-                default="",
-                required=False,
-            ),
-        },
-        key="holdings_onboarding_editor",
-    )
+    with st.form("onboarding_form"):
+        edited_df = st.data_editor(
+            st.session_state.onboarding_table_seed,
+            num_rows="dynamic",
+            use_container_width=True,
+            column_config={
+                "ticker": st.column_config.TextColumn("Ticker", required=False),
+                "shares": st.column_config.NumberColumn("Shares", min_value=0.0, step=0.01, format="%.4f"),
+                "avg_buy_price": st.column_config.NumberColumn(
+                    "Average Buy Price",
+                    min_value=0.0,
+                    step=0.01,
+                    format="%.2f",
+                ),
+                "position_type": st.column_config.SelectboxColumn(
+                    "Mode",
+                    options=["", "monitor"],
+                    default="",
+                    required=False,
+                ),
+            },
+            key="holdings_onboarding_editor",
+        )
 
-    st.session_state.onboarding_table = edited_df
+        submitted = st.form_submit_button("Save holdings", type="primary", use_container_width=True)
 
-    if st.button("Save holdings", type="primary", use_container_width=True):
+    if submitted:
         normalized_df = normalize_onboarding_table(edited_df)
         filtered_df = filter_blank_rows(normalized_df)
         errors = validate_onboarding_table(filtered_df)
@@ -232,6 +340,7 @@ def render_onboarding_page() -> None:
         save_portfolio_state(
             pd.DataFrame([{"free_cash": 0.0, "updated_at": datetime.now().isoformat()}], columns=PORTFOLIO_STATE_COLUMNS)
         )
+        st.session_state.onboarding_table_seed = build_default_onboarding_table()
         st.session_state["show_main_page"] = True
         st.rerun()
 
@@ -268,36 +377,37 @@ def load_analytics_table(holdings_df: pd.DataFrame) -> pd.DataFrame:
 def render_add_stocks_section(current_holdings_df: pd.DataFrame) -> None:
     st.subheader("Add Stocks")
 
-    if "add_stocks_table" not in st.session_state:
-        st.session_state.add_stocks_table = build_default_onboarding_table()
+    if "add_stocks_table_seed" not in st.session_state:
+        st.session_state.add_stocks_table_seed = build_default_onboarding_table()
 
     with st.expander("Add new stocks or monitors"):
-        edited_df = st.data_editor(
-            st.session_state.add_stocks_table,
-            num_rows="dynamic",
-            use_container_width=True,
-            column_config={
-                "ticker": st.column_config.TextColumn("Ticker", required=False),
-                "shares": st.column_config.NumberColumn("Shares", min_value=0.0, step=0.01, format="%.4f"),
-                "avg_buy_price": st.column_config.NumberColumn(
-                    "Average Buy Price",
-                    min_value=0.0,
-                    step=0.01,
-                    format="%.2f",
-                ),
-                "position_type": st.column_config.SelectboxColumn(
-                    "Mode",
-                    options=["", "monitor"],
-                    default="",
-                    required=False,
-                ),
-            },
-            key="add_stocks_editor",
-        )
+        with st.form("add_stocks_form"):
+            edited_df = st.data_editor(
+                st.session_state.add_stocks_table_seed,
+                num_rows="dynamic",
+                use_container_width=True,
+                column_config={
+                    "ticker": st.column_config.TextColumn("Ticker", required=False),
+                    "shares": st.column_config.NumberColumn("Shares", min_value=0.0, step=0.01, format="%.4f"),
+                    "avg_buy_price": st.column_config.NumberColumn(
+                        "Average Buy Price",
+                        min_value=0.0,
+                        step=0.01,
+                        format="%.2f",
+                    ),
+                    "position_type": st.column_config.SelectboxColumn(
+                        "Mode",
+                        options=["", "monitor"],
+                        default="",
+                        required=False,
+                    ),
+                },
+                key="add_stocks_editor",
+            )
 
-        st.session_state.add_stocks_table = edited_df
+            submitted = st.form_submit_button("Add to holdings", type="primary", use_container_width=True)
 
-        if st.button("Add to holdings", type="primary", use_container_width=True):
+        if submitted:
             normalized_df = normalize_onboarding_table(edited_df)
             filtered_df = filter_blank_rows(normalized_df)
             existing_tickers = set(
@@ -313,8 +423,180 @@ def render_add_stocks_section(current_holdings_df: pd.DataFrame) -> None:
             new_rows_df = onboarding_to_holdings(filtered_df)
             updated_holdings_df = pd.concat([current_holdings_df, new_rows_df], ignore_index=True)
             save_holdings(updated_holdings_df)
-            st.session_state.add_stocks_table = build_default_onboarding_table()
+            st.session_state.add_stocks_table_seed = build_default_onboarding_table()
             st.success("New stocks added to holdings.")
+            st.rerun()
+
+
+def render_sell_section(current_holdings_df: pd.DataFrame) -> None:
+    st.subheader("Sell")
+
+    if "sell_table_seed" not in st.session_state:
+        st.session_state.sell_table_seed = build_default_sell_table()
+
+    with st.expander("Record sales"):
+        with st.form("sell_form"):
+            edited_df = st.data_editor(
+                st.session_state.sell_table_seed,
+                num_rows="dynamic",
+                use_container_width=True,
+                column_config={
+                    "ticker": st.column_config.SelectboxColumn(
+                        "Ticker",
+                        options=sorted(current_holdings_df["ticker"].dropna().astype(str).str.strip().str.upper().unique().tolist()),
+                        required=False,
+                    ),
+                    "shares_sold": st.column_config.NumberColumn("Shares Sold", min_value=0.0, step=0.01, format="%.4f"),
+                    "cash_received": st.column_config.NumberColumn("Cash Received", min_value=0.0, step=0.01, format="%.2f"),
+                },
+                key="sell_editor",
+            )
+            submitted = st.form_submit_button("Apply sales", type="primary", use_container_width=True)
+
+        if submitted:
+            normalized_df = normalize_sell_table(edited_df)
+            filtered_df = filter_blank_rows(normalized_df)
+
+            errors = validate_sell_table(filtered_df, current_holdings_df)
+            if errors:
+                for error in errors:
+                    st.error(error)
+                return
+
+            updated_holdings_df = current_holdings_df.copy()
+            reminders_df = load_reminders()
+            portfolio_state_df = load_portfolio_state()
+            free_cash = float(portfolio_state_df.iloc[0]["free_cash"]) if not portfolio_state_df.empty else 0.0
+
+            for _, sale_row in filtered_df.iterrows():
+                ticker = sale_row["ticker"]
+                shares_sold = float(sale_row["shares_sold"])
+                cash_received = float(sale_row["cash_received"])
+
+                holding_index = updated_holdings_df.index[updated_holdings_df["ticker"] == ticker][0]
+                updated_holdings_df.loc[holding_index, "shares"] = float(updated_holdings_df.loc[holding_index, "shares"]) - shares_sold
+
+                if updated_holdings_df.loc[holding_index, "shares"] <= 0:
+                    updated_holdings_df.loc[holding_index, "shares"] = 0.0
+                    updated_holdings_df.loc[holding_index, "active"] = False
+
+                free_cash += cash_received
+
+                reminder_row = pd.DataFrame(
+                    [
+                        {
+                            "ticker": ticker,
+                            "reminder_type": "rebuy",
+                            "message": f"Sold {shares_sold:.4f} shares and generated cash.",
+                            "created_at": datetime.now().isoformat(),
+                            "status": "open",
+                            "target_price": pd.NA,
+                            "target_condition": "Monitor for buyback opportunity",
+                            "linked_from_action": "sold into spike",
+                            "priority": "medium",
+                            "shares_sold": shares_sold,
+                            "cash_generated": cash_received,
+                            "resolved_at": "",
+                            "notes": "",
+                        }
+                    ],
+                    columns=REMINDERS_COLUMNS,
+                )
+                reminders_df = pd.concat([reminders_df, reminder_row], ignore_index=True)
+
+            save_holdings(updated_holdings_df)
+            save_portfolio_state(
+                pd.DataFrame([{"free_cash": free_cash, "updated_at": datetime.now().isoformat()}], columns=PORTFOLIO_STATE_COLUMNS)
+            )
+            save_reminders(reminders_df)
+
+            st.session_state.sell_table_seed = build_default_sell_table()
+            st.success("Sales recorded and reminders created.")
+            st.rerun()
+
+
+def render_buyback_section(current_holdings_df: pd.DataFrame) -> None:
+    st.subheader("Bought Back")
+
+    if "buyback_table_seed" not in st.session_state:
+        st.session_state.buyback_table_seed = build_default_buyback_table()
+
+    with st.expander("Record buybacks"):
+        with st.form("buyback_form"):
+            edited_df = st.data_editor(
+                st.session_state.buyback_table_seed,
+                num_rows="dynamic",
+                use_container_width=True,
+                column_config={
+                    "ticker": st.column_config.SelectboxColumn(
+                        "Ticker",
+                        options=sorted(current_holdings_df["ticker"].dropna().astype(str).str.strip().str.upper().unique().tolist()),
+                        required=False,
+                    ),
+                    "shares_bought": st.column_config.NumberColumn("Shares Bought", min_value=0.0, step=0.01, format="%.4f"),
+                    "avg_buy_price": st.column_config.NumberColumn("Average Buy Price", min_value=0.0, step=0.01, format="%.2f"),
+                    "cash_spent": st.column_config.NumberColumn("Cash Spent", min_value=0.0, step=0.01, format="%.2f"),
+                },
+                key="buyback_editor",
+            )
+            submitted = st.form_submit_button("Apply buybacks", type="primary", use_container_width=True)
+
+        if submitted:
+            normalized_df = normalize_buyback_table(edited_df)
+            filtered_df = filter_blank_rows(normalized_df)
+
+            portfolio_state_df = load_portfolio_state()
+            free_cash = float(portfolio_state_df.iloc[0]["free_cash"]) if not portfolio_state_df.empty else 0.0
+
+            errors = validate_buyback_table(filtered_df, current_holdings_df, free_cash)
+            if errors:
+                for error in errors:
+                    st.error(error)
+                return
+
+            updated_holdings_df = current_holdings_df.copy()
+            reminders_df = load_reminders()
+
+            total_cash_spent = 0.0
+            for _, buyback_row in filtered_df.iterrows():
+                ticker = buyback_row["ticker"]
+                shares_bought = float(buyback_row["shares_bought"])
+                avg_buy_price = float(buyback_row["avg_buy_price"])
+                cash_spent = float(buyback_row["cash_spent"])
+                total_cash_spent += cash_spent
+
+                holding_index = updated_holdings_df.index[updated_holdings_df["ticker"] == ticker][0]
+                existing_shares = float(updated_holdings_df.loc[holding_index, "shares"]) if pd.notna(updated_holdings_df.loc[holding_index, "shares"]) else 0.0
+                existing_avg_buy = float(updated_holdings_df.loc[holding_index, "avg_buy_price"]) if pd.notna(updated_holdings_df.loc[holding_index, "avg_buy_price"]) else 0.0
+
+                new_total_shares = existing_shares + shares_bought
+                new_total_cost = (existing_shares * existing_avg_buy) + (shares_bought * avg_buy_price)
+                new_avg_buy = new_total_cost / new_total_shares if new_total_shares > 0 else avg_buy_price
+
+                updated_holdings_df.loc[holding_index, "shares"] = new_total_shares
+                updated_holdings_df.loc[holding_index, "avg_buy_price"] = new_avg_buy
+                updated_holdings_df.loc[holding_index, "active"] = True
+                updated_holdings_df.loc[holding_index, "position_type"] = ""
+
+                matching_open_reminders = reminders_df.index[
+                    (reminders_df["ticker"] == ticker)
+                    & (reminders_df["status"].astype(str).str.lower() == "open")
+                    & (reminders_df["reminder_type"].astype(str).str.lower() == "rebuy")
+                ]
+                if len(matching_open_reminders) > 0:
+                    reminders_df.loc[matching_open_reminders, "status"] = "done"
+                    reminders_df.loc[matching_open_reminders, "resolved_at"] = datetime.now().isoformat()
+
+            free_cash -= total_cash_spent
+
+            save_holdings(updated_holdings_df)
+            save_portfolio_state(
+                pd.DataFrame([{"free_cash": free_cash, "updated_at": datetime.now().isoformat()}], columns=PORTFOLIO_STATE_COLUMNS)
+            )
+            save_reminders(reminders_df)
+
+            st.session_state.buyback_table_seed = build_default_buyback_table()
+            st.success("Buybacks recorded and holdings updated.")
             st.rerun()
 
 
@@ -351,7 +633,7 @@ def render_portfolio_comparison(actual_analytics_df: pd.DataFrame) -> None:
     )
 
     st.subheader("Theoretical vs Actual Portfolio Value")
-    comparison_columns = st.columns(5)
+    comparison_columns = st.columns(4)
     comparison_columns[0].metric(
         "Theoretical Value",
         _format_currency(comparison["theoretical_portfolio_value"]),
@@ -370,11 +652,6 @@ def render_portfolio_comparison(actual_analytics_df: pd.DataFrame) -> None:
         _format_currency(comparison["strategy_value_add"]),
         _format_percent(comparison["strategy_value_add_pct"]),
     )
-
-    if comparison_columns[4].button("Save Snapshot", use_container_width=True):
-        _append_strategy_snapshot(comparison, holdings_count=len(actual_analytics_df))
-        st.success("Strategy snapshot saved.")
-        st.rerun()
 
 
 def _render_focus_table(title: str, df: pd.DataFrame, help_text: str) -> None:
@@ -413,28 +690,6 @@ def _render_focus_table(title: str, df: pd.DataFrame, help_text: str) -> None:
     )
 
 
-def _append_strategy_snapshot(comparison: dict, holdings_count: int) -> None:
-    performance_df = load_performance()
-    snapshot_row = pd.DataFrame(
-        [
-            {
-                "snapshot_date": datetime.now().isoformat(),
-                "theoretical_portfolio_value": comparison["theoretical_portfolio_value"],
-                "actual_equity_value": comparison["actual_equity_value"],
-                "free_cash": comparison["free_cash"],
-                "actual_total_portfolio_value": comparison["actual_portfolio_value"],
-                "strategy_edge_value": comparison["strategy_value_add"],
-                "strategy_edge_pct": comparison["strategy_value_add_pct"],
-                "holdings_count": holdings_count,
-                "notes": "",
-            }
-        ],
-        columns=PERFORMANCE_COLUMNS,
-    )
-    updated_performance_df = pd.concat([performance_df, snapshot_row], ignore_index=True)
-    save_performance(updated_performance_df)
-
-
 def render_reminders_section(holdings_df: pd.DataFrame) -> None:
     st.subheader("Rebuy / Watch Reminders")
 
@@ -457,6 +712,8 @@ def render_reminders_section(holdings_df: pd.DataFrame) -> None:
             options=["", "sold into spike", "trimmed position", "manual note"],
         )
         priority = st.selectbox("Priority", options=["low", "medium", "high"])
+        shares_sold = st.number_input("Shares Sold", min_value=0.0, value=0.0, step=0.01)
+        cash_generated = st.number_input("Cash Generated", min_value=0.0, value=0.0, step=0.01)
         reminder_notes = st.text_area("Notes")
 
         if st.button("Save reminder", use_container_width=True):
@@ -475,6 +732,8 @@ def render_reminders_section(holdings_df: pd.DataFrame) -> None:
                             "target_condition": target_condition.strip(),
                             "linked_from_action": linked_from_action,
                             "priority": priority,
+                            "shares_sold": shares_sold if shares_sold > 0 else pd.NA,
+                            "cash_generated": cash_generated if cash_generated > 0 else pd.NA,
                             "resolved_at": "",
                             "notes": reminder_notes.strip(),
                         }
@@ -495,7 +754,7 @@ def render_reminders_section(holdings_df: pd.DataFrame) -> None:
         return
 
     for row_index, row in open_reminders_df.iterrows():
-        columns = st.columns([2, 1, 3, 2, 2, 1, 1])
+        columns = st.columns([2, 1, 3, 2, 2, 2, 1, 1])
         columns[0].write(f"**{row['ticker']}**")
         columns[1].write(str(row["reminder_type"]))
         columns[2].write(str(row["message"]))
@@ -507,64 +766,26 @@ def render_reminders_section(holdings_df: pd.DataFrame) -> None:
             if str(row["priority"]).strip() or str(row["target_condition"]).strip()
             else "—"
         )
+        columns[5].write(
+            f"Sold {row['shares_sold']:.4f} | Cash {_format_currency(row['cash_generated'])}"
+            if pd.notna(row["shares_sold"]) or pd.notna(row["cash_generated"])
+            else "—"
+        )
 
         done_key = f"done_reminder_{row_index}"
         ignore_key = f"ignore_reminder_{row_index}"
 
-        if columns[5].button("Done", key=done_key):
+        if columns[6].button("Done", key=done_key):
             reminders_df.loc[row_index, "status"] = "done"
             reminders_df.loc[row_index, "resolved_at"] = datetime.now().isoformat()
             save_reminders(reminders_df)
             st.rerun()
 
-        if columns[6].button("Ignore", key=ignore_key):
+        if columns[7].button("Ignore", key=ignore_key):
             reminders_df.loc[row_index, "status"] = "ignored"
             reminders_df.loc[row_index, "resolved_at"] = datetime.now().isoformat()
             save_reminders(reminders_df)
             st.rerun()
-
-
-def render_strategy_history_section() -> None:
-    st.subheader("Strategy Edge History")
-
-    try:
-        performance_df = load_performance()
-    except Exception as exc:
-        st.error(f"Could not load performance history: {exc}")
-        return
-
-    if performance_df.empty:
-        st.info("No strategy history snapshots saved yet.")
-        return
-
-    st.dataframe(
-        performance_df[
-            [
-                "snapshot_date",
-                "theoretical_portfolio_value",
-                "actual_equity_value",
-                "free_cash",
-                "actual_total_portfolio_value",
-                "strategy_edge_value",
-                "strategy_edge_pct",
-                "holdings_count",
-                "notes",
-            ]
-        ],
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "snapshot_date": st.column_config.TextColumn("Snapshot Time"),
-            "theoretical_portfolio_value": st.column_config.NumberColumn("Theoretical", format="$%.2f"),
-            "actual_equity_value": st.column_config.NumberColumn("Actual Equity", format="$%.2f"),
-            "free_cash": st.column_config.NumberColumn("Free Cash", format="$%.2f"),
-            "actual_total_portfolio_value": st.column_config.NumberColumn("Actual Total", format="$%.2f"),
-            "strategy_edge_value": st.column_config.NumberColumn("Strategy Edge", format="$%.2f"),
-            "strategy_edge_pct": st.column_config.NumberColumn("Strategy Edge %", format="%.2f%%"),
-            "holdings_count": st.column_config.NumberColumn("Holdings Count", format="%d"),
-            "notes": st.column_config.TextColumn("Notes"),
-        },
-    )
 
 
 def render_main_page() -> None:
@@ -625,7 +846,8 @@ def render_main_page() -> None:
 
     render_reminders_section(holdings_df)
     render_add_stocks_section(holdings_df)
-    render_strategy_history_section()
+    render_sell_section(holdings_df)
+    render_buyback_section(holdings_df)
 
     st.subheader("Analysis Table")
     display_analytics_df = analytics_df[DEFAULT_ANALYTICS_COLUMNS].copy()

@@ -4,13 +4,13 @@ from pathlib import Path
 from typing import List
 
 import pandas as pd
+from pandas.errors import EmptyDataError
 
 DATA_DIR = Path("data")
 HOLDINGS_PATH = DATA_DIR / "holdings.csv"
 ORIGINAL_HOLDINGS_PATH = DATA_DIR / "original_holdings.csv"
 PORTFOLIO_STATE_PATH = DATA_DIR / "portfolio_state.csv"
 REMINDERS_PATH = DATA_DIR / "reminders.csv"
-PERFORMANCE_PATH = DATA_DIR / "performance.csv"
 
 HOLDINGS_COLUMNS = [
     "ticker",
@@ -37,19 +37,9 @@ REMINDERS_COLUMNS = [
     "target_condition",
     "linked_from_action",
     "priority",
+    "shares_sold",
+    "cash_generated",
     "resolved_at",
-    "notes",
-]
-
-PERFORMANCE_COLUMNS = [
-    "snapshot_date",
-    "theoretical_portfolio_value",
-    "actual_equity_value",
-    "free_cash",
-    "actual_total_portfolio_value",
-    "strategy_edge_value",
-    "strategy_edge_pct",
-    "holdings_count",
     "notes",
 ]
 
@@ -81,16 +71,20 @@ def initialize_data_files() -> None:
     if not REMINDERS_PATH.exists():
         _build_empty_frame(REMINDERS_COLUMNS).to_csv(REMINDERS_PATH, index=False)
 
-    if not PERFORMANCE_PATH.exists():
-        _build_empty_frame(PERFORMANCE_COLUMNS).to_csv(PERFORMANCE_PATH, index=False)
-
 
 def _read_csv(path: str | Path, expected_columns: List[str], table_name: str) -> pd.DataFrame:
     csv_path = Path(path)
     if not csv_path.exists():
         return _build_empty_frame(expected_columns)
 
-    df = pd.read_csv(csv_path)
+    if csv_path.stat().st_size == 0:
+        return _build_empty_frame(expected_columns)
+
+    try:
+        df = pd.read_csv(csv_path)
+    except EmptyDataError:
+        return _build_empty_frame(expected_columns)
+
     if df.empty and list(df.columns) == []:
         return _build_empty_frame(expected_columns)
 
@@ -247,6 +241,8 @@ def load_reminders(path: str | Path = REMINDERS_PATH) -> pd.DataFrame:
     normalized_df["target_condition"] = normalized_df["target_condition"].fillna("").astype(str)
     normalized_df["linked_from_action"] = normalized_df["linked_from_action"].fillna("").astype(str)
     normalized_df["priority"] = normalized_df["priority"].fillna("medium").astype(str).str.strip().str.lower()
+    normalized_df["shares_sold"] = pd.to_numeric(normalized_df["shares_sold"], errors="coerce")
+    normalized_df["cash_generated"] = pd.to_numeric(normalized_df["cash_generated"], errors="coerce")
     normalized_df["resolved_at"] = normalized_df["resolved_at"].fillna("").astype(str)
     normalized_df["notes"] = normalized_df["notes"].fillna("").astype(str)
 
@@ -264,38 +260,4 @@ def save_reminders(df: pd.DataFrame, path: str | Path = REMINDERS_PATH) -> None:
         working_df["status"] = working_df["status"].fillna("open").astype(str).str.strip().str.lower()
         working_df["priority"] = working_df["priority"].fillna("medium").astype(str).str.strip().str.lower()
 
-    working_df.to_csv(csv_path, index=False)
-
-
-def load_performance(path: str | Path = PERFORMANCE_PATH) -> pd.DataFrame:
-    df = _read_csv(path, PERFORMANCE_COLUMNS, "performance")
-    if df.empty:
-        return _build_empty_frame(PERFORMANCE_COLUMNS)
-
-    normalized_df = df.copy()
-    numeric_columns = [
-        "theoretical_portfolio_value",
-        "actual_equity_value",
-        "free_cash",
-        "actual_total_portfolio_value",
-        "strategy_edge_value",
-        "strategy_edge_pct",
-        "holdings_count",
-    ]
-    for column in numeric_columns:
-        normalized_df[column] = pd.to_numeric(normalized_df[column], errors="coerce")
-
-    text_columns = ["snapshot_date", "notes"]
-    for column in text_columns:
-        normalized_df[column] = normalized_df[column].fillna("").astype(str)
-
-    return normalized_df.reset_index(drop=True)
-
-
-def save_performance(df: pd.DataFrame, path: str | Path = PERFORMANCE_PATH) -> None:
-    csv_path = Path(path)
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-
-    working_df = df.copy()
-    _ensure_columns(working_df, PERFORMANCE_COLUMNS, "performance")
     working_df.to_csv(csv_path, index=False)
